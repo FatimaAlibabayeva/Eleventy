@@ -1,6 +1,6 @@
 """
 PromptWall: OpenAI-compatible proxy that detects and blocks prompt injection.
-FastAPI app with /health, /v1/models, /v1/chat/completions, and dashboard endpoints.
+FastAPI app with /health, /v1/models, /v1/chat/completions, /demo/analyze, and dashboard endpoints.
 """
 
 import logging
@@ -10,7 +10,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 
@@ -27,6 +27,8 @@ pipeline: DetectionPipeline | None = None
 session_manager: SessionManager | None = None
 hardener: PromptHardener | None = None
 
+DEMO_TENANT_ID = "demo"
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -42,6 +44,7 @@ async def lifespan(app: FastAPI):
         hardener = PromptHardener()
         app.state.pipeline = pipeline
         app.state.session_mgr = session_manager
+        app.state.hardener = hardener
         logger.info(
             "PromptWall ready — ML=%s model=promptwall-distilbert Upstream=%s Judge=%s",
             "enabled" if pipeline.ml_classifier.available else "disabled",
@@ -68,6 +71,37 @@ app.add_middleware(
 )
 
 
+async def _call_upstream(message: str, score: float) -> str:
+    """Call upstream LLM with a single user message (hardened). Returns response text or empty string."""
+    if hardener is None:
+        return ""
+    hardened = hardener.harden(message, score)
+    payload = {
+        "model": config.settings.UPSTREAM_MODEL,
+        "messages": [{"role": "user", "content": hardened}],
+        "stream": False,
+    }
+    headers = {
+        "Authorization": f"Bearer {config.settings.UPSTREAM_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    url = f"{config.settings.UPSTREAM_BASE_URL.rstrip('/')}/chat/completions"
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.post(url, json=payload, headers=headers)
+            if r.status_code != 200:
+                return ""
+            data = r.json()
+            choices = data.get("choices") or []
+            if not choices:
+                return ""
+            msg = choices[0].get("message") or {}
+            return (msg.get("content") or "")[:500]
+    except Exception as e:
+        logger.warning("Upstream call failed in demo: %s", e)
+        return ""
+
+
 def _last_user_message(messages: list) -> str:
     """Extract last user message from OpenAI messages array."""
     for m in reversed(messages or []):
@@ -86,28 +120,56 @@ def _last_user_message(messages: list) -> str:
 
 @app.get("/health")
 async def health() -> dict:
-    """Health check with service name, version, upstream model, ML status, uptime."""
-    try:
-        ml_loaded = (
-            pipeline is not None
-            and getattr(pipeline, "ml_classifier", None) is not None
-            and getattr(pipeline.ml_classifier, "available", False)
-        )
-        return {
-            "status": "ok",
-            "service": "promptwall",
-            "version": "1.0.0",
-            "upstream_model": config.settings.UPSTREAM_MODEL,
-            "ml_enabled": config.settings.ML_ENABLED,
-            "ml_loaded": ml_loaded,
-            "uptime_seconds": round(time.time() - START_TIME, 2),
-        }
-    except Exception as e:
-        logger.warning("Health check error: %s", e)
-        return JSONResponse(
-            status_code=503,
-            content={"status": "error", "message": str(e)},
-        )
+    """Health check — returns 200 immediately for Railway/load balancers."""
+    return {"status": "ok", "version": "1.0.0"}
+
+
+@app.post("/demo/analyze")
+async def demo_analyze(request: Request):
+    """
+    Demo endpoint: analyze a plain text message, return structured result.
+    If not blocked, optionally forward to LLM and return response snippet.
+    """
+    if pipeline is None or session_manager is None or hardener is None:
+        raise HTTPException(status_code=503, detail="Service not ready")
+    body = await request.json()
+    message = (body.get("message") or "").strip()
+    session_id = body.get("session_id") or str(uuid.uuid4())
+    if not message:
+        raise HTTPException(status_code=400, detail="Message required, max 2000 chars")
+    if len(message) > 2000:
+        raise HTTPException(status_code=400, detail="Message max 2000 chars")
+    tenant_id = _tenant_key(DEMO_TENANT_ID)
+    session = await session_manager.get_session(tenant_id, session_id)
+    result = await pipeline.analyze(message, session)
+    session["score"] = result.score
+    session.setdefault("turns", []).append({
+        "text": message[:100],
+        "score": result.score,
+        "blocked": result.blocked,
+        "timestamp": time.time(),
+    })
+    if len(session["turns"]) > 10:
+        session["turns"] = session["turns"][-10:]
+    session["triggered_rules"] = list(set(session.get("triggered_rules", []) + result.rules))
+    await session_manager.save_session(tenant_id, session_id, session)
+    out = {
+        "blocked": result.blocked,
+        "score": round(result.score, 3),
+        "stage": result.stage,
+        "rules": result.rules,
+        "technique": result.technique,
+        "reasoning": getattr(result, "reasoning", "") or "",
+        "latency_ms": round(result.latency_ms, 1),
+        "session_score": round(session["score"], 3),
+        "turn_number": len(session["turns"]),
+        "ml_label": getattr(result, "meta_label", "N/A"),
+        "response": None,
+    }
+    if not result.blocked:
+        response_text = await _call_upstream(message, result.score)
+        out["response"] = response_text or None
+    return out
 
 
 @app.get("/v1/models")
@@ -256,7 +318,6 @@ async def chat_completions(request: Request):
                     status_code=503,
                     content={"error": "Upstream unreachable"},
                 )
-        # Upstream rate limit or server error — return 503 so clients can retry later
         if r.status_code in (429, 503):
             logger.warning("Upstream returned %s (rate limit or unavailable)", r.status_code)
             return JSONResponse(
@@ -292,10 +353,19 @@ async def chat_completions(request: Request):
 
 @app.get("/dashboard")
 async def dashboard():
-    """Serve dashboard static index.html."""
+    """Serve dashboard static index.html (live demo UI)."""
     path = Path(__file__).parent / "dashboard" / "static" / "index.html"
     if not path.exists():
         return JSONResponse(status_code=404, content={"error": "Dashboard not found"})
+    return FileResponse(path)
+
+
+@app.get("/demo")
+async def demo_page():
+    """Serve demo UI (single-page demo connected to this proxy)."""
+    path = Path(__file__).parent / "demo.html"
+    if not path.exists():
+        return JSONResponse(status_code=404, content={"error": "Demo not found"})
     return FileResponse(path)
 
 
