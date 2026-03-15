@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PromptWall Dashboard</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; margin: 1rem; background: #0f172a; color: #e2e8f0; }
+    h1 { color: #38bdf8; }
+    section { margin: 1.5rem 0; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid #334155; padding: 0.5rem 0.75rem; text-align: left; }
+    th { background: #1e293b; color: #94a3b8; }
+    tr:nth-child(even) { background: #1e293b; }
+    .blocked { color: #f87171; }
+    .clean { color: #4ade80; }
+    button { background: #3b82f6; color: white; border: none; padding: 0.5rem 1rem; border-radius: 0.25rem; cursor: pointer; }
+    button:hover { background: #2563eb; }
+    button.danger { background: #dc2626; }
+    #stats { display: flex; gap: 1rem; flex-wrap: wrap; }
+    #stats span { background: #1e293b; padding: 0.75rem 1rem; border-radius: 0.5rem; }
+  </style>
+</head>
+<body>
+  <h1>PromptWall Dashboard</h1>
+  <p>Real-time view of detection events and aggregate stats (multi-tenant).</p>
+  <section>
+    <label>Tenant ID: <input type="text" id="tenant" value="default" placeholder="default" /></label>
+    <button onclick="applyTenant()">Apply</button>
+  </section>
+  <section>
+    <h2>Stats <span id="tenantLabel"></span></h2>
+    <div id="stats"></div>
+    <button onclick="loadStats()">Refresh stats</button>
+    <button class="danger" onclick="reset()">Reset this tenant</button>
+  </section>
+  <section>
+    <h2>Recent events (last 100)</h2>
+    <button onclick="loadEvents()">Refresh events</button>
+    <table>
+      <thead>
+        <tr>
+          <th>Time</th>
+          <th>Blocked</th>
+          <th>Score</th>
+          <th>Stage</th>
+          <th>Rules</th>
+          <th>Technique</th>
+          <th>Latency (ms)</th>
+        </tr>
+      </thead>
+      <tbody id="events"></tbody>
+    </table>
+  </section>
+  <script>
+    const base = '';
+    function tenantParam() {
+      const t = document.getElementById('tenant').value.trim() || 'default';
+      return '?tenant=' + encodeURIComponent(t);
+    }
+    function applyTenant() {
+      document.getElementById('tenantLabel').textContent = '(tenant: ' + (document.getElementById('tenant').value.trim() || 'default') + ')';
+      loadStats();
+      loadEvents();
+    }
+    async function loadStats() {
+      try {
+        const r = await fetch(base + '/dashboard/stats' + tenantParam());
+        const s = await r.json();
+        document.getElementById('stats').innerHTML = [
+          `<span>Total events: ${s.total_events ?? 0}</span>`,
+          `<span>Blocked: ${s.blocked ?? 0}</span>`,
+          `<span>Clean: ${s.clean ?? 0}</span>`,
+        ].join('');
+      } catch (e) {
+        document.getElementById('stats').textContent = 'Failed to load stats';
+      }
+    }
+    async function loadEvents() {
+      try {
+        const r = await fetch(base + '/dashboard/events' + tenantParam());
+        const d = await r.json();
+        const events = d.events || [];
+        const tbody = document.getElementById('events');
+        tbody.innerHTML = events.slice(0, 100).map(e => {
+          const time = e.timestamp ? new Date(e.timestamp * 1000).toISOString() : '-';
+          const blocked = e.blocked ? '<span class="blocked">Yes</span>' : '<span class="clean">No</span>';
+          const rules = (e.rules || []).join(', ') || '-';
+          return `<tr><td>${time}</td><td>${blocked}</td><td>${(e.score ?? 0).toFixed(2)}</td><td>${e.stage ?? '-'}</td><td>${rules}</td><td>${e.technique ?? '-'}</td><td>${e.latency_ms ?? '-'}</td></tr>`;
+        }).join('') || '<tr><td colspan="7">No events</td></tr>';
+      } catch (e) {
+        document.getElementById('events').innerHTML = '<tr><td colspan="7">Failed to load events</td></tr>';
+      }
+    }
+    async function reset() {
+      if (!confirm('Reset session state and events for this tenant?')) return;
+      try {
+        await fetch(base + '/dashboard/reset' + tenantParam(), { method: 'DELETE' });
+        loadStats();
+        loadEvents();
+      } catch (e) {
+        alert('Reset failed');
+      }
+    }
+    applyTenant();
+  </script>
+</body>
+</html>
