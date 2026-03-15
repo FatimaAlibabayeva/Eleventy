@@ -242,4 +242,8 @@ client = OpenAI(base_url="http://localhost:8000/v1", api_key="placeholder")
 
 ## 10. Team
 
-[Your team member names here]
+Fidan Baghirova
+Ibrahim Huseynov
+Necef Quliyev
+Fatima Alibabayeva
+Emil Akbarov
