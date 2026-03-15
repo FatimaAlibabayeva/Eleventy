@@ -214,6 +214,14 @@ Runs entirely locally — no external API dependency for classification.
 
 ---
 
+## Dashboard
+
+- **`/dashboard`** — Full live demo: left panel (scenarios + input + send), center (pipeline stages, score bar, verdict), right (event log, auto-refresh). Uses default tenant; stats and reset are per-tenant.
+
+Scenario buttons in the dashboard include Git Clone attack, DAN jailbreak, RAG poisoning, Base64 payload, multi-turn T1–T4, and legitimate Code Help / Normal Question. Send T1→T2→T3→T4 in order with the same session to see multi-turn detection.
+
+---
+
 ## 8. How to Run
 
 1. **Clone** the repo and enter the project directory.
